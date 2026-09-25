@@ -19,11 +19,8 @@ import (
 	"github.com/google/go-containerregistry/pkg/authn"
 	"github.com/google/go-containerregistry/pkg/name"
 	"github.com/google/go-containerregistry/pkg/v1/remote"
-	"github.com/moby/buildkit/util/progress/progressui"
 	"github.com/moby/moby/client"
 	ispec "github.com/opencontainers/image-spec/specs-go/v1"
-	copacommon "github.com/project-copacetic/copacetic/pkg/common"
-	copapatch "github.com/project-copacetic/copacetic/pkg/patch"
 	copatypes "github.com/project-copacetic/copacetic/pkg/types"
 	"github.com/samber/mo"
 	"go.getarcane.app/acfs"
@@ -42,6 +39,12 @@ import (
 	"github.com/getarcaneapp/arcane/backend/v2/pkg/utils/logging"
 	activitytypes "github.com/getarcaneapp/arcane/types/v2/activity"
 	"github.com/getarcaneapp/arcane/types/v2/imagepatch"
+)
+
+// ErrPatchUnsupportedPlatform is returned when the platform cannot patch images.
+var ErrPatchUnsupportedPlatform = common.Classify(
+	common.ErrUnavailable,
+	errors.New("image patching is not supported on this platform"),
 )
 
 // ImagePatchService patches image OS packages in place using the Copacetic
@@ -89,6 +92,9 @@ func NewImagePatchService(db *database.DB, dockerService *docker.DockerClientSer
 // PatchImage starts a background patch run for the given image and returns the
 // pending record (carrying the activity ID) immediately.
 func (s *ImagePatchService) PatchImage(ctx context.Context, envID, imageID string, opts imagepatch.PatchOptions, user common.User) (*imagepatch.PatchRecord, error) {
+	if !copaSupported {
+		return nil, ErrPatchUnsupportedPlatform
+	}
 	if strings.TrimSpace(opts.ScanID) != "" {
 		if err := s.settingsService.RequireFeature(ctx, features.VulnerabilityManagement); err != nil {
 			return nil, err
@@ -250,7 +256,6 @@ func (s *ImagePatchService) patchInBackgroundInternal(ctx context.Context, recor
 		// so copa produces exactly the recorded reference.
 		PatchedTag:  record.PatchedRef[strings.LastIndex(record.PatchedRef, ":")+1:],
 		Timeout:     time.Duration(timeoutSeconds) * time.Second,
-		Progress:    progressui.QuietMode,
 		BkAddr:      "docker://",
 		IgnoreError: opts.IgnoreErrors,
 	}
@@ -274,7 +279,7 @@ func (s *ImagePatchService) patchInBackgroundInternal(ctx context.Context, recor
 	s.appendPatchActivityInternal(ctx, activityID, 30, "Patching image packages via BuildKit")
 	patchOut := activitylib.NewWriter(ctx, s.activityService, activityID, nil, "Patching image")
 	removeMirror := logging.AddLogrusMirror(patchOut)
-	patchErr := copapatch.Patch(ctx, copaOpts)
+	patchErr := copaPatchInternal(ctx, copaOpts)
 	removeMirror()
 	activitylib.FlushWriter(patchOut)
 	durationMs := time.Since(startTime).Milliseconds()
@@ -380,20 +385,6 @@ func platformPinnedRefInternal(ctx context.Context, imageRef string, target ispe
 		}
 	}
 	return ""
-}
-
-// resolvePatchedRef computes the patched reference with the exact same
-// resolution copa applies internally, so the recorded ref matches the result.
-func resolvePatchedRef(imageRef, patchedTag, suffix string) (string, error) {
-	named, err := reference.ParseNormalizedNamed(imageRef)
-	if err != nil {
-		return "", errors.WrapIf(err, "failed to parse image reference")
-	}
-	name, tag, err := copacommon.ResolvePatchedImageName(named, patchedTag, suffix)
-	if err != nil {
-		return "", errors.WrapIf(err, "failed to resolve patched image name")
-	}
-	return name + ":" + tag, nil
 }
 
 // writeRegistryAuthConfigInternal merges Arcane's registry credentials into the
@@ -699,6 +690,9 @@ func (s *ImagePatchService) latestPatchesByImageInternal(ctx context.Context, en
 // images already patched since their latest scan. Used by the scheduled
 // auto-patch job.
 func (s *ImagePatchService) PatchFlaggedImages(ctx context.Context, envID string, user common.User) (patched, skipped int, err error) {
+	if !copaSupported {
+		return 0, 0, ErrPatchUnsupportedPlatform
+	}
 	if err := s.settingsService.RequireFeature(ctx, features.VulnerabilityManagement); err != nil {
 		return 0, 0, err
 	}

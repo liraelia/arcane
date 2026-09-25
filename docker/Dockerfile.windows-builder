@@ -1,0 +1,86 @@
+# syntax=docker/dockerfile:1
+#
+# Stage A of the Windows build: cross-compile arcane.exe on a LINUX Docker host.
+#
+# Windows container images cannot be built on Linux (the base layers need a
+# Windows daemon), and there are no official Node images for Windows containers,
+# so the frontend + Go build stay on Linux and only the finished binary crosses
+# over. Stage B (docker/Dockerfile.windows) turns this binary into an image on
+# the Windows host.
+#
+# Build:
+#   docker build -f docker/Dockerfile.windows-builder \
+#     --build-arg VERSION="$(jq -r '.version // "dev"' .arcane.json)" \
+#     --output type=local,dest=./dist-windows .
+#
+# Produces: ./dist-windows/arcane.exe  (frontend embedded, no CGO, no DLLs)
+
+# timetzdata is REQUIRED for Windows: unlike Linux, Windows ships no system
+# zoneinfo database, so time.LoadLocation fails unless tzdata is embedded.
+ARG BUILD_TAGS="timetzdata"
+ARG GOARCH=amd64
+
+# Stage 1: Build Frontend
+FROM ghcr.io/voidzero-dev/vite-plus:latest AS frontend-builder
+ENV CI=true
+WORKDIR /app
+
+COPY --chown=vp:vp pnpm-lock.yaml pnpm-workspace.yaml package.json ./
+COPY --chown=vp:vp frontend/package.json ./frontend/package.json
+
+RUN --mount=type=cache,id=arcane-pnpm-v3,target=/home/vp/.local/share/pnpm/store,sharing=locked,uid=1000,gid=1000 \
+    vp install --frozen-lockfile --prefer-offline
+
+RUN printf 'NODE_VERSION=%s\nSVELTEKIT_VERSION=%s\n' \
+    "$(vp node --version)" \
+    "$(vp -C frontend node -p 'require("@sveltejs/kit/package.json").version')" \
+    > /tmp/arcane-frontend-build.env
+
+COPY --chown=vp:vp frontend ./frontend
+
+ENV BUILD_PATH=dist
+ENV NODE_OPTIONS="--max-old-space-size=4096"
+RUN vp -C frontend run build
+
+# Stage 2: Cross-compile the backend for Windows
+FROM golang:1.27-trixie AS backend-builder
+ARG BUILD_TAGS
+ARG GOARCH
+ARG VERSION="dev"
+ARG REVISION="unknown"
+ARG BUILD_TIME="unknown"
+WORKDIR /build
+
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl git tzdata jq \
+    && apt-get clean && rm -rf /var/lib/apt/lists/*
+
+COPY go.work ./
+COPY types ./types
+COPY cli ./cli
+COPY backend/go.mod backend/go.sum ./backend/
+WORKDIR /build/backend
+RUN --mount=type=cache,target=/go/pkg/mod \
+    go mod download
+COPY backend ./
+COPY .arcane.json ../arcane.json
+
+COPY --from=frontend-builder /app/frontend/dist ./frontend/dist
+COPY --from=frontend-builder /tmp/arcane-frontend-build.env /tmp/arcane-frontend-build.env
+
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    . /tmp/arcane-frontend-build.env && \
+    if [ "${VERSION}" = "dev" ]; then VERSION=$(jq -r '.version // "dev"' ../arcane.json); fi && \
+    if [ "${REVISION}" = "unknown" ]; then REVISION=$(jq -r '.revision // "unknown"' ../arcane.json); fi && \
+    if [ "${BUILD_TIME}" = "unknown" ]; then BUILD_TIME=$(jq -r '.buildTime // "unknown"' ../arcane.json); fi && \
+    CGO_ENABLED=0 GOOS=windows GOARCH="${GOARCH}" \
+    go build \
+    -tags "${BUILD_TAGS}" \
+    -ldflags "-w -s -X github.com/getarcaneapp/arcane/backend/v2/internal/config.Version=${VERSION} -X github.com/getarcaneapp/arcane/backend/v2/internal/config.Revision=${REVISION} -X github.com/getarcaneapp/arcane/backend/v2/internal/config.BuildTime=${BUILD_TIME} -X github.com/getarcaneapp/arcane/backend/v2/internal/config.NodeVersion=${NODE_VERSION} -X github.com/getarcaneapp/arcane/backend/v2/internal/config.SvelteKitVersion=${SVELTEKIT_VERSION}" \
+    -trimpath \
+    -o /build/arcane.exe \
+    ./cmd/main.go
+
+# Stage 3: export-only layer for --output type=local
+FROM scratch AS export
+COPY --from=backend-builder /build/arcane.exe /arcane.exe

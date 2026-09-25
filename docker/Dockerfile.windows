@@ -1,0 +1,57 @@
+# Windows container image, packaged from a prebuilt arcane.exe like
+# Dockerfile-static is. Build it on a Windows container host: Windows base
+# layers cannot be built on Linux.
+#
+# The binary is cross-compiled on Linux, because there are no official Node
+# images for Windows containers. timetzdata is required, as Windows ships no
+# system zoneinfo database and time.LoadLocation fails without it:
+#
+#   cd backend && CGO_ENABLED=0 GOOS=windows GOARCH=amd64 \
+#     go build -tags timetzdata -trimpath -o ../arcane.exe ./cmd/main.go
+#
+# Build one image per supported host, because the base image tag has to match
+# the host build under process isolation. This file runs no build step, so
+# either host can build both:
+#
+#   docker build -f Dockerfile.windows -t arcane:windows-ltsc2022 \
+#     --build-arg ARCANE_RUNTIME_BASE_IMAGE=mcr.microsoft.com/windows/nanoserver:ltsc2022 .
+#   docker build -f Dockerfile.windows -t arcane:windows-ltsc2025 \
+#     --build-arg ARCANE_RUNTIME_BASE_IMAGE=mcr.microsoft.com/windows/nanoserver:ltsc2025 .
+#
+# Publish both under one tag so Docker selects by the host's os.version:
+#
+#   docker buildx imagetools create -t <registry>/arcane:<version>-windows \
+#     <registry>/arcane:windows-ltsc2022 <registry>/arcane:windows-ltsc2025
+ARG ARCANE_RUNTIME_BASE_IMAGE
+FROM ${ARCANE_RUNTIME_BASE_IMAGE}
+
+WORKDIR C:\\arcane
+
+COPY arcane.exe ./arcane.exe
+
+ENV ENVIRONMENT=production
+ENV GIN_MODE=release
+ENV PORT=3552
+ENV ARCANE_IN_CONTAINER=true
+
+# The Windows engine listens on a named pipe rather than a unix socket.
+ENV DOCKER_HOST=npipe:////./pipe/docker_engine
+
+# These default to paths that are not absolute on Windows, so they would resolve
+# against the current drive root instead of the data volume. Setting
+# BUILDS_DIRECTORY also skips NormalizeBuildsDirectory.
+ENV DOCKER_CONFIG=C:\\arcane\\data\\.docker
+ENV PROJECTS_DIRECTORY=C:\\arcane\\data\\projects
+ENV TEMPLATES_DIRECTORY=C:\\arcane\\data\\templates
+ENV BUILDS_DIRECTORY=C:\\arcane\\data\\builds
+
+# PUID and PGID are deliberately unset: os.Geteuid() returns -1 on Windows, so
+# the runtime continues as the current user instead of dropping privileges.
+USER ContainerAdministrator
+
+EXPOSE 3552
+VOLUME ["C:/arcane/data"]
+
+LABEL com.getarcaneapp.arcane="true"
+
+CMD ["C:\\arcane\\arcane.exe"]
