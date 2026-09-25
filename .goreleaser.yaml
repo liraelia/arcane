@@ -20,11 +20,17 @@ builds:
     main: ./cmd/main.go
     dir: backend
     binary: arcane
+    # timetzdata is required for the windows target: Windows ships no system
+    # zoneinfo database, so time.LoadLocation fails without the embedded copy.
+    # Harmless on linux/darwin, where system zoneinfo still takes precedence.
+    tags:
+      - timetzdata
     env:
       - CGO_ENABLED=0
     goos:
       - linux
       - darwin
+      - windows
     goarch:
       - amd64
       - arm64
@@ -41,6 +47,14 @@ builds:
       - rva20u64
     ignore:
       - goos: darwin
+        goarch: riscv64
+      # Windows containers are amd64 (arm64 kept for the standalone binary);
+      # the rest are not worth shipping.
+      - goos: windows
+        goarch: '386'
+      - goos: windows
+        goarch: arm
+      - goos: windows
         goarch: riscv64
     ldflags:
       - -w -s

@@ -2,12 +2,15 @@
 
 Arcane's Windows build has two stages:
 
-1. **`docker/Dockerfile.windows-builder`** cross-compiles `arcane.exe` on a Linux
-   Docker host (the frontend build has to stay on Linux — there are no official
-   Node images for Windows containers).
+1. **goreleaser** cross-compiles `arcane.exe`, exactly as it does for every other
+   platform — the `arcane` build in `.goreleaser.yaml` lists `windows` in its
+   `goos` and carries the `timetzdata` tag. The frontend is built once by the
+   `before:` hook and embedded into every target, so nothing Windows-specific is
+   needed to produce the binary.
 2. **`docker/Dockerfile.windows`** turns that binary into an image. It is
-   COPY-only, and `docker build` can only run it **on a Windows container host**,
-   because a Linux daemon cannot materialise Windows base layers.
+   COPY-only — the same shape as `docker/Dockerfile-static` for Linux — and
+   `docker build` can only run it **on a Windows container host**, because a Linux
+   daemon cannot materialise Windows base layers.
 
 This tool replaces stage 2 when no Windows host is available. A container image
 is only a manifest, a config and some layers, so it builds the layer and the
@@ -17,10 +20,11 @@ image: `docker pull` and `docker run` on Windows Server treat it like any other.
 ## Usage
 
 ```sh
-# stage 1: cross-compile on Linux
-docker build -f docker/Dockerfile.windows-builder \
-  --build-arg VERSION="$(jq -r .version .arcane.json)" \
-  --output type=local,dest=./dist-windows .
+# stage 1: cross-compile on Linux (or take the .exe from a release build)
+just build single frontend
+cd backend && CGO_ENABLED=0 GOOS=windows GOARCH=amd64 \
+  go build -tags timetzdata -trimpath -o ../dist-windows/arcane.exe ./cmd/main.go
+cd ..
 
 # stage 2: package and push, from Linux
 cd docker/windows-image
